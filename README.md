@@ -1,0 +1,1 @@
+# newbie.aws-secrets-manager
