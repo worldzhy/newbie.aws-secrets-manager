@@ -1,7 +1,7 @@
 import {PrismaService} from '@framework/prisma/prisma.service';
 import {Body, Controller, Delete, Get, Param, Patch, Post, Query} from '@nestjs/common';
 import {ApiTags} from '@nestjs/swagger';
-import {Prisma} from '@prisma/client';
+import {Prisma} from '@generated/prisma/client';
 import {CreateSecretDto, ListSecretsRequestDto, UpdateSecretDto} from './aws-secrets-manager.dto';
 
 @ApiTags('AWS Secrets Manager')

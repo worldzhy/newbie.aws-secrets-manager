@@ -1,7 +1,7 @@
 import {ApiProperty} from '@nestjs/swagger';
 import {IsString, IsOptional, IsEnum} from 'class-validator';
 import {CommonListRequestDto, CommonListResponseDto} from '@framework/common.dto';
-import {SecretType} from '@prisma/client';
+import {SecretType} from '@generated/prisma/client';
 
 export class ListSecretsRequestDto extends CommonListRequestDto {}
 
