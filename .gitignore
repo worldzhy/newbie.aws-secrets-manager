@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# SST (Serverless Stack)
+infrastructure/.sst/
+infrastructure/node_modules/
+infrastructure/sst-env.d.ts
+
+# Environment variables
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
