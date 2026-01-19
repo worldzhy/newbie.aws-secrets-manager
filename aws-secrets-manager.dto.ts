@@ -16,9 +16,10 @@ export class CreateSecretDto {
   @IsString()
   name: string;
 
-  @ApiProperty({description: 'Project ID', required: true})
+  @ApiProperty({description: 'Secret description', required: false})
+  @IsOptional()
   @IsString()
-  projectId: string;
+  description?: string;
 
   @ApiProperty({enum: SecretType, description: 'Secret type', required: true})
   @IsEnum(SecretType)
@@ -28,6 +29,11 @@ export class CreateSecretDto {
   @IsObject()
   secretValue: Record<string, any>;
 
+  @ApiProperty({description: 'AWS Region (defaults to region in configuration)', required: false})
+  @IsOptional()
+  @IsString()
+  region?: string;
+
   @ApiProperty({
     description: 'Enable automatic rotation (only for RDS_CREDENTIALS/DOCUMENTDB_CREDENTIALS/AWS_API_KEY)',
     default: false,
@@ -35,7 +41,7 @@ export class CreateSecretDto {
   })
   @IsOptional()
   @IsBoolean()
-  enableRotation?: boolean;
+  rotationEnabled?: boolean;
 
   @ApiProperty({
     description: 'Rotation rules configuration',
@@ -48,15 +54,9 @@ export class CreateSecretDto {
   @ValidateIf(o => o.enableRotation === true)
   rotationRules?: {AutomaticallyAfterDays: number};
 
-  @ApiProperty({description: 'AWS Region (defaults to region in configuration)', required: false})
-  @IsOptional()
+  @ApiProperty({description: 'Group ID', required: true})
   @IsString()
-  awsRegion?: string;
-
-  @ApiProperty({description: 'Secret description', required: false})
-  @IsOptional()
-  @IsString()
-  description?: string;
+  secretGroupId: string;
 }
 
 export class UpdateSecretDto {
@@ -88,13 +88,13 @@ export class GetSecretValueResponseDto {
   description?: string | null;
 
   @ApiProperty({description: 'AWS Secret ARN'})
-  awsSecretArn: string;
+  arn: string;
 
   @ApiProperty({description: 'AWS Region'})
-  awsRegion: string;
+  region: string;
 
   @ApiProperty({description: 'Enable automatic rotation'})
-  enableRotation: boolean;
+  rotationEnabled: boolean;
 
   @ApiProperty({description: 'Lambda ARN', required: false})
   rotationLambdaArn?: string | null;
@@ -107,6 +107,7 @@ export class GetSecretValueResponseDto {
 
   @ApiProperty({description: 'Created at'})
   createdAt: Date;
+
   @ApiProperty({description: 'Updated at'})
   updatedAt: Date;
 }

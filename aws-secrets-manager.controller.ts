@@ -1,5 +1,5 @@
 import {PrismaService} from '@framework/prisma/prisma.service';
-import {Body, Controller, Delete, Get, Param, Patch, Post, Query, NotFoundException} from '@nestjs/common';
+import {Body, Controller, Delete, Get, Param, Patch, Post, Query} from '@nestjs/common';
 import {ApiTags, ApiOperation, ApiResponse, ApiBearerAuth} from '@nestjs/swagger';
 import {Prisma} from '@generated/prisma/client';
 import {
@@ -25,14 +25,14 @@ export class AwsSecretsManagerController {
   @ApiResponse({status: 201, description: 'Secret created successfully'})
   async createSecret(@Body() body: CreateSecretDto) {
     return await this.secretsService.createSecret({
-      projectId: body.projectId,
       name: body.name,
       type: body.type,
+      region: body.region,
       secretValue: body.secretValue,
-      enableRotation: body.enableRotation,
+      rotationEnabled: body.rotationEnabled,
       rotationRules: body.rotationRules,
-      awsRegion: body.awsRegion,
       description: body.description,
+      secretGroupId: body.secretGroupId,
     });
   }
 
@@ -42,58 +42,19 @@ export class AwsSecretsManagerController {
     return await this.prisma.findManyInManyPages({
       model: Prisma.ModelName.Secret,
       pagination: {page: query.page, pageSize: query.pageSize},
-      findManyArgs: {
-        orderBy: {createdAt: 'desc'},
-        select: {
-          id: true,
-          name: true,
-          type: true,
-          description: true,
-          enableRotation: true,
-          lastRotatedAt: true,
-          awsSecretArn: true,
-          awsRegion: true,
-          createdAt: true,
-          updatedAt: true,
-        },
-      },
+      findManyArgs: {orderBy: {createdAt: 'desc'}},
     });
   }
 
   @Get(':id')
   @ApiOperation({summary: 'Get Secret metadata (no secret value)'})
   async getSecret(@Param('id') id: string) {
-    const secret = await this.prisma.secret.findUnique({
-      where: {id},
-      select: {
-        id: true,
-        name: true,
-        type: true,
-        description: true,
-        enableRotation: true,
-        lastRotatedAt: true,
-        awsSecretArn: true,
-        awsRegion: true,
-        rotationRules: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    });
-
-    if (!secret) {
-      throw new NotFoundException(`Secret not found: ${id}`);
-    }
-
-    return secret;
+    return await this.prisma.secret.findUniqueOrThrow({where: {id}});
   }
 
   @Get(':id/value')
   @ApiOperation({summary: 'Get complete Secret information (including secret value)'})
-  @ApiResponse({
-    status: 200,
-    type: GetSecretValueResponseDto,
-    description: 'Complete Secret information (including secret value)',
-  })
+  @ApiResponse({type: GetSecretValueResponseDto, description: 'Complete Secret information (including secret value)'})
   async getSecretValue(@Param('id') id: string): Promise<GetSecretValueResponseDto> {
     // This endpoint is called when user clicks "View Password" in UI
     return await this.secretsService.getSecretWithValue(id);

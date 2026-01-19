@@ -3,7 +3,7 @@ import {
   GetRandomPasswordCommand,
   UpdateSecretVersionStageCommand,
 } from '@aws-sdk/client-secrets-manager';
-import * as mysql from 'mysql2/promise';
+import * as mysql from 'mysql2/promise.js';
 import {RotationStrategy, smClient} from '../common.js';
 
 export class RdsMysqlStrategy implements RotationStrategy {

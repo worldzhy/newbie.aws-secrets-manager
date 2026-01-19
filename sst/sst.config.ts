@@ -11,7 +11,7 @@ export default $config({
   async run() {
     // 创建 Secrets Manager 轮询 Lambda 函数
     const rotationFunction = new sst.aws.Function('SecretsManagerRotation', {
-      handler: 'lambda/rotation-handler.handler',
+      handler: 'function/index.handler',
       runtime: 'nodejs20.x',
       timeout: '30 seconds',
       memory: '512 MB',

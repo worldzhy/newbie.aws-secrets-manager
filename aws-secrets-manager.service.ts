@@ -1,18 +1,14 @@
 import {
   Injectable,
-  Logger,
   BadRequestException,
   NotFoundException,
   ConflictException,
   InternalServerErrorException,
 } from '@nestjs/common';
-import {ConfigService} from '@nestjs/config';
 import {PrismaService} from '@framework/prisma/prisma.service';
 import {exec} from 'child_process';
 import * as path from 'path';
 import {promisify} from 'util';
-
-const execAsync = promisify(exec);
 import {
   SecretsManagerClient,
   CreateSecretCommand,
@@ -24,41 +20,36 @@ import {
 } from '@aws-sdk/client-secrets-manager';
 import {SecretType} from '@generated/prisma/client';
 
+const execAsync = promisify(exec);
+
 @Injectable()
 export class AwsSecretsManagerService {
-  private readonly logger = new Logger(AwsSecretsManagerService.name);
-  private client: SecretsManagerClient;
   private activeDeployments = new Set<string>();
 
-  constructor(
-    private readonly prisma: PrismaService,
-    private readonly config: ConfigService
-  ) {
-    // Basic init removed, client will be created per request
-  }
+  constructor(private readonly prisma: PrismaService) {}
 
   /**
    * Create a new Secret
    */
   async createSecret(params: {
-    projectId: string;
     name: string;
-    type: SecretType;
-    secretValue: Record<string, any>;
     description?: string;
-    enableRotation?: boolean;
+    type: SecretType;
+    region?: string;
+    rotationEnabled?: boolean;
     rotationRules?: {AutomaticallyAfterDays: number};
-    awsRegion?: string;
+    secretValue: Record<string, any>;
+    secretGroupId: string;
   }) {
-    const {projectId, name, type, secretValue, description, enableRotation, rotationRules, awsRegion} = params;
+    const {secretGroupId, name, type, secretValue, description, rotationEnabled, rotationRules, region} = params;
 
     // Get Project Config
-    const projectConfig = await this.getProjectAwsConfig(projectId);
-    const client = this.getClient(projectConfig, awsRegion);
-    const lambdaArn = enableRotation ? projectConfig.rotationLambdaArn : undefined;
+    const secretGroup = await this.getReadySecretGroup(secretGroupId);
+    const client = this.getClient(secretGroup, region);
+    const lambdaArn = rotationEnabled ? secretGroup.rotationLambdaArn : undefined;
 
     // Validate rotation prerequisites
-    if (enableRotation) {
+    if (rotationEnabled) {
       if (!this.isRotationSupported(type)) {
         throw new BadRequestException(`Secret type ${type} does not support automatic rotation`);
       }
@@ -68,7 +59,7 @@ export class AwsSecretsManagerService {
     }
 
     // Check name uniqueness in database
-    const existing = await this.prisma.secret.findUnique({where: {name}});
+    const existing = await this.prisma.secret.findUnique({where: {name_groupId: {name, groupId: secretGroupId}}});
     if (existing) {
       throw new ConflictException(`Secret name "${name}" already exists`);
     }
@@ -89,7 +80,7 @@ export class AwsSecretsManagerService {
       // If ResourceNotFoundException, we are good to go
     }
 
-    let awsSecretArn: string;
+    let arn: string;
     let awsSecretCreated = false;
 
     try {
@@ -101,24 +92,20 @@ export class AwsSecretsManagerService {
       });
 
       const result = await client.send(createCommand);
-      awsSecretArn = result.ARN!;
+      arn = result.ARN!;
       awsSecretCreated = true;
 
-      this.logger.log(`AWS Secret created: ${name}, ARN: ${awsSecretArn}`);
-
       // Enable rotation if requested
-      if (enableRotation) {
+      if (rotationEnabled) {
         try {
-          await this.enableRotation({
+          await this.rotationEnabled({
             client,
             secretId: name,
             lambdaArn: lambdaArn!,
             rotationRules: rotationRules || {AutomaticallyAfterDays: 30},
           });
-          this.logger.log(`Rotation enabled for Secret: ${name}`);
         } catch (rotationError) {
           // Rollback: Delete the created AWS Secret
-          this.logger.error(`Failed to enable rotation: ${rotationError.message}`);
           await client.send(
             new DeleteSecretCommand({
               SecretId: name,
@@ -132,26 +119,23 @@ export class AwsSecretsManagerService {
       // Save metadata to database
       const dbRecord = await this.prisma.secret.create({
         data: {
-          projectId,
           name,
-          type,
-          awsSecretArn,
-          awsRegion: awsRegion || projectConfig.region,
-          enableRotation: enableRotation || false,
-          rotationLambdaArn: enableRotation ? lambdaArn : null,
-          rotationRules: rotationRules ? (rotationRules as any) : null,
           description,
+          type,
+          arn,
+          region,
+          rotationEnabled: rotationEnabled || false,
+          rotationLambdaArn: rotationEnabled ? lambdaArn : null,
+          rotationRules: rotationRules ? (rotationRules as any) : null,
+          groupId: secretGroupId,
         },
       });
 
-      this.logger.log(`Secret metadata saved to database: ${dbRecord.id}`);
       return dbRecord;
     } catch (error) {
       // If database save fails but AWS Secret was created, rollback is needed
       if (awsSecretCreated && error.code !== 'P2002') {
         // P2002 is Prisma unique constraint violation error
-        this.logger.error('Database save failed, rolling back AWS Secret...');
-        this.logger.error('Database save failed, rolling back AWS Secret...');
         try {
           await client.send(
             new DeleteSecretCommand({
@@ -159,9 +143,7 @@ export class AwsSecretsManagerService {
               ForceDeleteWithoutRecovery: true,
             })
           );
-        } catch (rollbackError) {
-          this.logger.error(`Rollback failed: ${rollbackError.message}`);
-        }
+        } catch (rollbackError) {}
       }
       throw error;
     }
@@ -171,17 +153,13 @@ export class AwsSecretsManagerService {
    * Get complete Secret information (including secret value)
    */
   async getSecretWithValue(secretId: string) {
-    const secret = await this.prisma.secret.findUnique({
+    const secret = await this.prisma.secret.findUniqueOrThrow({
       where: {id: secretId},
     });
 
-    if (!secret) {
-      throw new NotFoundException(`Secret not found: ${secretId}`);
-    }
-
     // Get Project Config
-    const projectConfig = await this.getProjectAwsConfig(secret.projectId);
-    const client = this.getClient(projectConfig, secret.awsRegion);
+    const secretGroup = await this.getReadySecretGroup(secret.groupId);
+    const client = this.getClient(secretGroup, secret.region);
 
     // Fetch current version from AWS (AWSCURRENT)
     let secretValue: Record<string, any>;
@@ -201,7 +179,6 @@ export class AwsSecretsManagerService {
         secretValue = {};
       }
     } catch (error) {
-      this.logger.error(`Failed to get Secret from AWS: ${error.message}`);
       throw new BadRequestException(`Failed to get Secret from AWS Secrets Manager: ${error.message}`);
     }
 
@@ -209,10 +186,10 @@ export class AwsSecretsManagerService {
       id: secret.id,
       name: secret.name,
       type: secret.type,
-      awsSecretArn: secret.awsSecretArn,
-      awsRegion: secret.awsRegion,
+      arn: secret.arn,
+      region: secret.region,
       description: secret.description,
-      enableRotation: secret.enableRotation,
+      rotationEnabled: secret.rotationEnabled,
       rotationLambdaArn: secret.rotationLambdaArn,
       rotationRules: secret.rotationRules,
       lastRotatedAt: secret.lastRotatedAt,
@@ -237,8 +214,8 @@ export class AwsSecretsManagerService {
     const {secretValue, description} = updateData;
 
     // Get Project Config
-    const projectConfig = await this.getProjectAwsConfig(secret.projectId);
-    const client = this.getClient(projectConfig, secret.awsRegion);
+    const secretGroup = await this.getReadySecretGroup(secret.groupId);
+    const client = this.getClient(secretGroup, secret.region);
 
     // Update AWS Secret
     try {
@@ -251,7 +228,6 @@ export class AwsSecretsManagerService {
         await client.send(updateCommand);
       }
     } catch (error) {
-      this.logger.error(`Failed to update AWS Secret: ${error.message}`);
       throw new BadRequestException(`Failed to update AWS Secret: ${error.message}`);
     }
 
@@ -282,11 +258,9 @@ export class AwsSecretsManagerService {
     // It's safer to try-catch the config retrieval too.
     let client: SecretsManagerClient | null = null;
     try {
-      const projectConfig = await this.getProjectAwsConfig(secret.projectId);
-      client = this.getClient(projectConfig, secret.awsRegion);
-    } catch (e) {
-      this.logger.warn(`Could not get project config for deletion: ${e.message}`);
-    }
+      const secretGroup = await this.getReadySecretGroup(secret.groupId);
+      client = this.getClient(secretGroup, secret.region);
+    } catch (e) {}
 
     // Delete AWS Secret
     if (client) {
@@ -298,13 +272,10 @@ export class AwsSecretsManagerService {
         });
 
         await client.send(deleteCommand);
-        this.logger.log(`AWS Secret deleted: ${secret.name}`);
       } catch (error) {
         if (error.name === 'ResourceNotFoundException') {
           // AWS Secret does not exist, only delete local record
-          this.logger.warn('AWS Secret not found, deleting local record only');
         } else {
-          this.logger.error(`Failed to delete AWS Secret: ${error.message}`);
           // We might still want to delete local record if AWS delete fails?
           // Usually yes if we want to clean up ghost records.
         }
@@ -329,13 +300,13 @@ export class AwsSecretsManagerService {
       throw new NotFoundException(`Secret not found: ${secretId}`);
     }
 
-    if (!secret.enableRotation) {
+    if (!secret.rotationEnabled) {
       throw new BadRequestException('This Secret does not have automatic rotation enabled');
     }
 
     // Get Project Config
-    const projectConfig = await this.getProjectAwsConfig(secret.projectId);
-    const client = this.getClient(projectConfig, secret.awsRegion);
+    const secretGroup = await this.getReadySecretGroup(secret.groupId);
+    const client = this.getClient(secretGroup, secret.region);
 
     try {
       const rotateCommand = new RotateSecretCommand({
@@ -350,10 +321,8 @@ export class AwsSecretsManagerService {
         data: {lastRotatedAt: new Date()},
       });
 
-      this.logger.log(`Secret rotated successfully: ${secret.name}`);
       return result;
     } catch (error) {
-      this.logger.error(`Failed to rotate Secret: ${error.message}`);
       throw new BadRequestException(`Failed to rotate Secret: ${error.message}`);
     }
   }
@@ -361,7 +330,7 @@ export class AwsSecretsManagerService {
   /**
    * Enable Rotation (private method)
    */
-  private async enableRotation(params: {
+  private async rotationEnabled(params: {
     client: SecretsManagerClient;
     secretId: string;
     lambdaArn: string;
@@ -381,8 +350,8 @@ export class AwsSecretsManagerService {
   /**
    * Check if AWS Secret exists
    */
-  async isExistingInAws(name: string, awsRegion?: string): Promise<boolean> {
-    // Checking requires client, which requires projectId, but check is usually done before creation
+  async isExistingInAws(name: string, region?: string): Promise<boolean> {
+    // Checking requires client, which requires secretGroupId, but check is usually done before creation
     // We can't check without project config.
     // Refactoring createSecret to do check internally after fetching config.
     // This public method might be problematic if called from outside with just name.
@@ -393,24 +362,20 @@ export class AwsSecretsManagerService {
   /**
    * Deploy Rotation Lambda using SST
    */
-  async deployRotationLambda(projectId: string) {
-    if (this.activeDeployments.has(projectId)) {
+  async deployRotationLambda(secretGroupId: string) {
+    if (this.activeDeployments.has(secretGroupId)) {
       throw new ConflictException('Deployment/Removal already in progress.');
     }
 
     // Validate project existence before starting background task
-    const project = await this.prisma.project.findUnique({where: {id: projectId}});
-    if (!project) throw new NotFoundException(`Project not found: ${projectId}`);
-
-    this.activeDeployments.add(projectId);
+    const project = await this.prisma.project.findUniqueOrThrow({where: {id: secretGroupId}});
+    this.activeDeployments.add(project.id);
 
     // Set initial status
-    await this.updateDeploymentStatus(projectId, 'DEPLOYING');
+    await this.updateDeploymentStatus(project.id, 'DEPLOYING');
 
     // Start background task
-    this._deployRotationLambdaBackground(projectId).catch(err => {
-      this.logger.error(`Background deployment validation failed: ${err.message}`);
-    });
+    this._deployRotationLambdaBackground(project.id).catch(err => {});
 
     return {
       success: true,
@@ -418,14 +383,10 @@ export class AwsSecretsManagerService {
     };
   }
 
-  private async _deployRotationLambdaInternal(projectId: string) {
-    const project = await this.prisma.project.findUnique({
-      where: {id: projectId},
+  private async _deployRotationLambdaInternal(secretGroupId: string) {
+    const project = await this.prisma.project.findUniqueOrThrow({
+      where: {id: secretGroupId},
     });
-
-    if (!project) {
-      throw new NotFoundException(`Project not found: ${projectId}`);
-    }
 
     if (
       !project.awsSecretsManagerAccessKeyId ||
@@ -437,7 +398,6 @@ export class AwsSecretsManagerService {
 
     // Path to infra directory within the microservice
     const infraPath = path.resolve(process.cwd(), 'src/microservices/aws-secrets-manager/infrastructure');
-    this.logger.log(`Deploying Rotation Lambda for project ${projectId} from ${infraPath}...`);
 
     try {
       // Prepare environment variables
@@ -448,14 +408,12 @@ export class AwsSecretsManagerService {
         AWS_REGION: project.awsSecretsManagerRegion,
       };
 
-      const command = `npm install && npx sst deploy --stage ${projectId}`;
+      const command = `npm install && npx sst deploy --stage ${secretGroupId}`;
       const options = {
         cwd: infraPath,
         env,
         maxBuffer: 10 * 1024 * 1024,
       };
-
-      this.logger.log(`Executing command: ${command}`);
 
       let stdout = '';
       let stderr = '';
@@ -468,11 +426,8 @@ export class AwsSecretsManagerService {
         // Check for Lock Error
         const errorOutput = execError.stdout?.toString() || '';
         if (errorOutput.includes('Locked') && errorOutput.includes('sst unlock')) {
-          this.logger.warn(`SST Lock detected. Executing unlock for stage ${projectId}...`);
-
           // Run Unlock
-          await execAsync(`npx sst unlock --stage ${projectId}`, options);
-          this.logger.log(`Stage unlocked. Retrying deployment...`);
+          await execAsync(`npx sst unlock --stage ${secretGroupId}`, options);
 
           // Retry Deploy
           const retryResult = await execAsync(command, options);
@@ -484,9 +439,7 @@ export class AwsSecretsManagerService {
         }
       }
 
-      this.logger.log(`SST Deploy Output: ${stdout}`);
       if (stderr) {
-        this.logger.warn(`SST Deploy Stderr: ${stderr}`);
       }
 
       // Parse Output for Lambda ARN or Name
@@ -499,15 +452,12 @@ export class AwsSecretsManagerService {
       const lambdaArn = (arnMatch?.[1] || arnMatchFallback?.[1])?.trim();
 
       if (!lambdaArn) {
-        this.logger.error('Could not find Lambda ARN in SST output');
         throw new InternalServerErrorException('Deployment completed but Lambda ARN could not be parsed from output.');
       }
 
-      this.logger.log(`Found Lambda ARN: ${lambdaArn}`);
-
       // Update Project Configuration
       await this.prisma.project.update({
-        where: {id: projectId},
+        where: {id: secretGroupId},
         data: {
           awsSecretsManagerRotationLambdaArn: lambdaArn,
         },
@@ -519,7 +469,6 @@ export class AwsSecretsManagerService {
         message: 'Rotation Lambda deployed and Project configuration updated successfully.',
       };
     } catch (error: any) {
-      this.logger.error(`Deployment failed details: ${JSON.stringify(error, Object.getOwnPropertyNames(error))}`);
       const stderr = error.stderr?.toString() || '';
       const stdout = error.stdout?.toString() || '';
 
@@ -532,23 +481,21 @@ export class AwsSecretsManagerService {
   /**
    * Remove Rotation Lambda
    */
-  async removeRotationLambda(projectId: string) {
-    if (this.activeDeployments.has(projectId)) {
+  async removeRotationLambda(secretGroupId: string) {
+    if (this.activeDeployments.has(secretGroupId)) {
       throw new ConflictException('Deployment/Removal already in progress.');
     }
 
-    const project = await this.prisma.project.findUnique({where: {id: projectId}});
-    if (!project) throw new NotFoundException(`Project not found: ${projectId}`);
+    const project = await this.prisma.project.findUnique({where: {id: secretGroupId}});
+    if (!project) throw new NotFoundException(`Project not found: ${secretGroupId}`);
 
-    this.activeDeployments.add(projectId);
+    this.activeDeployments.add(secretGroupId);
 
     // Set initial status
-    await this.updateDeploymentStatus(projectId, 'REMOVING');
+    await this.updateDeploymentStatus(secretGroupId, 'REMOVING');
 
     // Start background task
-    this._removeRotationLambdaBackground(projectId).catch(err => {
-      this.logger.error(`Background removal failed: ${err.message}`);
-    });
+    this._removeRotationLambdaBackground(secretGroupId).catch(err => {});
 
     return {
       success: true,
@@ -556,16 +503,15 @@ export class AwsSecretsManagerService {
     };
   }
 
-  private async _removeRotationLambdaInternal(projectId: string) {
+  private async _removeRotationLambdaInternal(secretGroupId: string) {
     const project = await this.prisma.project.findUnique({
-      where: {id: projectId},
+      where: {id: secretGroupId},
     });
 
-    if (!project) throw new NotFoundException(`Project not found: ${projectId}`);
+    if (!project) throw new NotFoundException(`Project not found: ${secretGroupId}`);
 
     // Path to infra directory within the microservice
     const infraPath = path.resolve(process.cwd(), 'src/microservices/aws-secrets-manager/infrastructure');
-    this.logger.log(`Removing Rotation Lambda for project ${projectId}...`);
 
     try {
       const env = {
@@ -575,20 +521,15 @@ export class AwsSecretsManagerService {
         AWS_REGION: project.awsSecretsManagerRegion || undefined,
       };
 
-      const command = `npx sst remove --stage ${projectId}`;
+      const command = `npx sst remove --stage ${secretGroupId}`;
       const options = {cwd: infraPath, env, maxBuffer: 10 * 1024 * 1024};
-
-      this.logger.log(`Executing command: ${command}`);
 
       try {
         const {stdout} = await execAsync(command, options);
-        this.logger.log(`SST Remove Output: ${stdout}`);
       } catch (execError: any) {
         const errorOutput = execError.stdout?.toString() || '';
         if (errorOutput.includes('Locked') && errorOutput.includes('sst unlock')) {
-          this.logger.warn(`SST Lock detected. Executing unlock...`);
-          await execAsync(`npx sst unlock --stage ${projectId}`, options);
-          this.logger.log(`Stage unlocked. Retrying removal...`);
+          await execAsync(`npx sst unlock --stage ${secretGroupId}`, options);
           await execAsync(command, options);
         } else {
           throw execError;
@@ -597,7 +538,7 @@ export class AwsSecretsManagerService {
 
       // Update Project Configuration
       await this.prisma.project.update({
-        where: {id: projectId},
+        where: {id: secretGroupId},
         data: {awsSecretsManagerRotationLambdaArn: null},
       });
 
@@ -606,7 +547,6 @@ export class AwsSecretsManagerService {
         message: 'Rotation Lambda removed and Project configuration updated successfully.',
       };
     } catch (error: any) {
-      this.logger.error(`Removal failed details: ${JSON.stringify(error, Object.getOwnPropertyNames(error))}`);
       throw new InternalServerErrorException(
         `Removal failed. Message: ${error.message}. \nStderr: ${(error.stderr || '').slice(-1000)}`
       );
@@ -615,37 +555,25 @@ export class AwsSecretsManagerService {
 
   // --- Helper Methods ---
 
-  private async getProjectAwsConfig(projectId: string) {
-    const project = await this.prisma.project.findUnique({
-      where: {id: projectId},
+  private async getReadySecretGroup(secretGroupId: string) {
+    const secretGroup = await this.prisma.secretGroup.findUniqueOrThrow({
+      where: {id: secretGroupId},
     });
 
-    if (!project) {
-      throw new NotFoundException(`Project not found: ${projectId}`);
-    }
-
-    if (
-      !project.awsSecretsManagerAccessKeyId ||
-      !project.awsSecretsManagerSecretAccessKey ||
-      !project.awsSecretsManagerRegion
-    ) {
-      throw new BadRequestException(`Project ${project.name} does not have AWS Secrets Manager configured`);
+    if (!secretGroup.accessKeyId || !secretGroup.secretAccessKey || !secretGroup.rotationLambdaArn) {
+      throw new BadRequestException(`Project ${secretGroup.name} does not have AWS Secrets Manager configured`);
     }
 
     return {
-      accessKeyId: project.awsSecretsManagerAccessKeyId,
-      secretAccessKey: project.awsSecretsManagerSecretAccessKey,
-      region: project.awsSecretsManagerRegion,
-      rotationLambdaArn: project.awsSecretsManagerRotationLambdaArn,
+      accessKeyId: secretGroup.accessKeyId,
+      secretAccessKey: secretGroup.secretAccessKey,
+      rotationLambdaArn: secretGroup.rotationLambdaArn,
     };
   }
 
-  private getClient(
-    config: {accessKeyId: string; secretAccessKey: string; region: string},
-    region?: string
-  ): SecretsManagerClient {
+  private getClient(config: {accessKeyId: string; secretAccessKey: string}, region?: string): SecretsManagerClient {
     return new SecretsManagerClient({
-      region: region || config.region,
+      region,
       credentials: {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
@@ -668,41 +596,37 @@ export class AwsSecretsManagerService {
 
   // --- Background Task Handlers ---
 
-  private async _deployRotationLambdaBackground(projectId: string) {
+  private async _deployRotationLambdaBackground(secretGroupId: string) {
     try {
-      await this._deployRotationLambdaInternal(projectId);
-      await this.updateDeploymentStatus(projectId, 'DEPLOYED', 'Deployment successful');
+      await this._deployRotationLambdaInternal(secretGroupId);
+      await this.updateDeploymentStatus(secretGroupId, 'DEPLOYED', 'Deployment successful');
     } catch (error: any) {
-      this.logger.error(`Background deployment failed: ${error.message}`);
-      await this.updateDeploymentStatus(projectId, 'FAILED', error.message);
+      await this.updateDeploymentStatus(secretGroupId, 'FAILED', error.message);
     } finally {
-      this.activeDeployments.delete(projectId);
+      this.activeDeployments.delete(secretGroupId);
     }
   }
 
-  private async _removeRotationLambdaBackground(projectId: string) {
+  private async _removeRotationLambdaBackground(secretGroupId: string) {
     try {
-      await this._removeRotationLambdaInternal(projectId);
-      await this.updateDeploymentStatus(projectId, 'IDLE', 'Removal successful');
+      await this._removeRotationLambdaInternal(secretGroupId);
+      await this.updateDeploymentStatus(secretGroupId, 'IDLE', 'Removal successful');
     } catch (error: any) {
-      this.logger.error(`Background removal failed: ${error.message}`);
-      await this.updateDeploymentStatus(projectId, 'FAILED', error.message);
+      await this.updateDeploymentStatus(secretGroupId, 'FAILED', error.message);
     } finally {
-      this.activeDeployments.delete(projectId);
+      this.activeDeployments.delete(secretGroupId);
     }
   }
 
-  private async updateDeploymentStatus(projectId: string, status: string, message?: string) {
+  private async updateDeploymentStatus(secretGroupId: string, status: string, message?: string) {
     try {
       await this.prisma.project.update({
-        where: {id: projectId},
+        where: {id: secretGroupId},
         data: {
           awsSecretsManagerDeploymentStatus: status,
           awsSecretsManagerDeploymentMessage: message || null,
         },
       });
-    } catch (e) {
-      this.logger.error(`Failed to update deployment status: ${e.message}`);
-    }
+    } catch (e) {}
   }
 }
