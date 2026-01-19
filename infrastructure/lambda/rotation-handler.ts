@@ -1,23 +1,23 @@
-import { GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
-import { RotationEvent, smClient, RotationStrategy } from './common.js';
-import { AwsApiKeyStrategy } from './strategies/aws-api-key.js';
-import { RdsMysqlStrategy } from './strategies/mysql.js';
-import { RdsPostgresStrategy } from './strategies/postgres.js';
-import { DocumentDbStrategy } from './strategies/documentdb.js';
-import { GenericStrategy } from './strategies/generic.js';
+import {GetSecretValueCommand} from '@aws-sdk/client-secrets-manager';
+import {RotationEvent, smClient, RotationStrategy} from './common.js';
+import {AwsApiKeyStrategy} from './strategies/aws-api-key.js';
+import {RdsMysqlStrategy} from './strategies/mysql.js';
+import {RdsPostgresStrategy} from './strategies/postgres.js';
+import {DocumentDbStrategy} from './strategies/documentdb.js';
+import {GenericStrategy} from './strategies/generic.js';
 
 export async function handler(event: RotationEvent): Promise<void> {
   console.log('Rotation event received:', JSON.stringify(event, null, 2));
-  const { Step, SecretId, ClientRequestToken } = event;
+  const {Step, SecretId, ClientRequestToken} = event;
 
   try {
     const strategy = await getStrategy(SecretId, ClientRequestToken, Step);
 
     // We need to fetch the secret data again for the strategy methods?
-    // Strategies expect (secretId, token, dict). 
+    // Strategies expect (secretId, token, dict).
     // My interface was: createSecret(secretId, token, currentDict).
     // So I should pass the loaded dictionaries to the strategy methods?
-    // Refactoring the interface slightly in my head: 
+    // Refactoring the interface slightly in my head:
     // The previous implementation fetched secret inside each step.
     // The strategies I wrote above also fetch secret inside or expect dict?
     // Let's check my strategies code.
@@ -29,7 +29,7 @@ export async function handler(event: RotationEvent): Promise<void> {
 
     // Fetch current secret for context
     const currentSecret = await smClient.send(
-      new GetSecretValueCommand({ SecretId: SecretId, VersionStage: 'AWSCURRENT' })
+      new GetSecretValueCommand({SecretId: SecretId, VersionStage: 'AWSCURRENT'})
     );
     const currentDict = JSON.parse(currentSecret.SecretString || '{}');
 
@@ -37,7 +37,7 @@ export async function handler(event: RotationEvent): Promise<void> {
     let pendingDict: any = {};
     if (Step === 'setSecret' || Step === 'testSecret') {
       const pendingSecret = await smClient.send(
-        new GetSecretValueCommand({ SecretId: SecretId, VersionId: ClientRequestToken, VersionStage: 'AWSPENDING' })
+        new GetSecretValueCommand({SecretId: SecretId, VersionId: ClientRequestToken, VersionStage: 'AWSPENDING'})
       );
       pendingDict = JSON.parse(pendingSecret.SecretString || '{}');
     }
@@ -47,7 +47,7 @@ export async function handler(event: RotationEvent): Promise<void> {
         // Check if AWSPENDING already exists
         try {
           await smClient.send(
-            new GetSecretValueCommand({ SecretId: SecretId, VersionId: ClientRequestToken, VersionStage: 'AWSPENDING' })
+            new GetSecretValueCommand({SecretId: SecretId, VersionId: ClientRequestToken, VersionStage: 'AWSPENDING'})
           );
           console.log('AWSPENDING already exists.');
           return;
@@ -81,7 +81,7 @@ async function getStrategy(secretId: string, token: string, step: string): Promi
   // Assuming type doesn't change during rotation (it shouldn't).
 
   const currentSecret = await smClient.send(
-    new GetSecretValueCommand({ SecretId: secretId, VersionStage: 'AWSCURRENT' })
+    new GetSecretValueCommand({SecretId: secretId, VersionStage: 'AWSCURRENT'})
   );
   const dict = JSON.parse(currentSecret.SecretString || '{}');
   const type = dict.nightwatch_secret_type;
