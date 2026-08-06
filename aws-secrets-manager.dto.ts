@@ -51,12 +51,12 @@ export class CreateSecretDto {
   })
   @IsOptional()
   @IsObject()
-  @ValidateIf(o => o.enableRotation === true)
+  @ValidateIf(o => o.rotationEnabled === true)
   rotationRules?: {AutomaticallyAfterDays: number};
 
-  @ApiProperty({description: 'Group ID', required: true})
+  @ApiProperty({description: 'Project ID', required: true})
   @IsString()
-  secretGroupId: string;
+  projectId: string;
 }
 
 export class UpdateSecretDto {

@@ -1,5 +1,5 @@
 import {PrismaService} from '@framework/prisma/prisma.service';
-import {Body, Controller, Delete, Get, Param, Patch, Post, Query} from '@nestjs/common';
+import {BadRequestException, Body, Controller, Delete, Get, Param, Patch, Post, Query} from '@nestjs/common';
 import {ApiTags, ApiOperation, ApiResponse, ApiBearerAuth} from '@nestjs/swagger';
 import {Prisma} from '@generated/prisma/client';
 import {
@@ -32,17 +32,28 @@ export class AwsSecretsManagerController {
       rotationEnabled: body.rotationEnabled,
       rotationRules: body.rotationRules,
       description: body.description,
-      secretGroupId: body.secretGroupId,
+      projectId: body.projectId,
     });
   }
 
   @Get('')
   @ApiOperation({summary: 'List all Secrets (metadata only, no secret values)'})
   async listSecrets(@Query() query: ListSecretsRequestDto) {
+    const project = await this.prisma.project.findUniqueOrThrow({
+      where: {id: query.projectId},
+      select: {secretGroupId: true},
+    });
+    if (!project.secretGroupId) {
+      throw new BadRequestException(`Project ${query.projectId} does not have a Secret Group configured`);
+    }
+
     return await this.prisma.findManyInManyPages({
       model: Prisma.ModelName.Secret,
       pagination: {page: query.page, pageSize: query.pageSize},
-      findManyArgs: {orderBy: {createdAt: 'desc'}},
+      findManyArgs: {
+        where: {groupId: project.secretGroupId},
+        orderBy: {createdAt: 'desc'},
+      },
     });
   }
 

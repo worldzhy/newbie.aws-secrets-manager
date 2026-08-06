@@ -6,6 +6,7 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import {PrismaService} from '@framework/prisma/prisma.service';
+import {AwsCredentialService} from '@microservices/aws-core/aws-credential.service';
 import {exec} from 'child_process';
 import * as path from 'path';
 import {promisify} from 'util';
@@ -26,7 +27,10 @@ const execAsync = promisify(exec);
 export class AwsSecretsManagerService {
   private activeDeployments = new Set<string>();
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly credentialService: AwsCredentialService
+  ) {}
 
   /**
    * Create a new Secret
@@ -39,14 +43,14 @@ export class AwsSecretsManagerService {
     rotationEnabled?: boolean;
     rotationRules?: {AutomaticallyAfterDays: number};
     secretValue: Record<string, any>;
-    secretGroupId: string;
+    projectId: string;
   }) {
-    const {secretGroupId, name, type, secretValue, description, rotationEnabled, rotationRules, region} = params;
+    const {projectId, name, type, secretValue, description, rotationEnabled, rotationRules, region} = params;
 
-    // Get Project Config
-    const secretGroup = await this.getReadySecretGroup(secretGroupId);
-    const client = this.getClient(secretGroup, region);
-    const lambdaArn = rotationEnabled ? secretGroup.rotationLambdaArn : undefined;
+    const projectConfig = await this.getProjectSecretConfig(projectId);
+    const resolvedRegion = region || projectConfig.defaultRegion;
+    const client = this.getClient(projectConfig, resolvedRegion);
+    const lambdaArn = rotationEnabled ? projectConfig.rotationLambdaArn : undefined;
 
     // Validate rotation prerequisites
     if (rotationEnabled) {
@@ -59,7 +63,9 @@ export class AwsSecretsManagerService {
     }
 
     // Check name uniqueness in database
-    const existing = await this.prisma.secret.findUnique({where: {name_groupId: {name, groupId: secretGroupId}}});
+    const existing = await this.prisma.secret.findUnique({
+      where: {name_groupId: {name, groupId: projectConfig.secretGroupId}},
+    });
     if (existing) {
       throw new ConflictException(`Secret name "${name}" already exists`);
     }
@@ -123,11 +129,11 @@ export class AwsSecretsManagerService {
           description,
           type,
           arn,
-          region,
+          region: resolvedRegion,
           rotationEnabled: rotationEnabled || false,
           rotationLambdaArn: rotationEnabled ? lambdaArn : null,
           rotationRules: rotationRules ? (rotationRules as any) : null,
-          groupId: secretGroupId,
+          groupId: projectConfig.secretGroupId,
         },
       });
 
@@ -157,9 +163,8 @@ export class AwsSecretsManagerService {
       where: {id: secretId},
     });
 
-    // Get Project Config
-    const secretGroup = await this.getReadySecretGroup(secret.groupId);
-    const client = this.getClient(secretGroup, secret.region);
+    const projectConfig = await this.getProjectSecretConfigByGroupId(secret.groupId);
+    const client = this.getClient(projectConfig, secret.region);
 
     // Fetch current version from AWS (AWSCURRENT)
     let secretValue: Record<string, any>;
@@ -213,9 +218,8 @@ export class AwsSecretsManagerService {
 
     const {secretValue, description} = updateData;
 
-    // Get Project Config
-    const secretGroup = await this.getReadySecretGroup(secret.groupId);
-    const client = this.getClient(secretGroup, secret.region);
+    const projectConfig = await this.getProjectSecretConfigByGroupId(secret.groupId);
+    const client = this.getClient(projectConfig, secret.region);
 
     // Update AWS Secret
     try {
@@ -258,8 +262,8 @@ export class AwsSecretsManagerService {
     // It's safer to try-catch the config retrieval too.
     let client: SecretsManagerClient | null = null;
     try {
-      const secretGroup = await this.getReadySecretGroup(secret.groupId);
-      client = this.getClient(secretGroup, secret.region);
+      const projectConfig = await this.getProjectSecretConfigByGroupId(secret.groupId);
+      client = this.getClient(projectConfig, secret.region);
     } catch (e) {}
 
     // Delete AWS Secret
@@ -304,9 +308,8 @@ export class AwsSecretsManagerService {
       throw new BadRequestException('This Secret does not have automatic rotation enabled');
     }
 
-    // Get Project Config
-    const secretGroup = await this.getReadySecretGroup(secret.groupId);
-    const client = this.getClient(secretGroup, secret.region);
+    const projectConfig = await this.getProjectSecretConfigByGroupId(secret.groupId);
+    const client = this.getClient(projectConfig, secret.region);
 
     try {
       const rotateCommand = new RotateSecretCommand({
@@ -555,20 +558,44 @@ export class AwsSecretsManagerService {
 
   // --- Helper Methods ---
 
-  private async getReadySecretGroup(secretGroupId: string) {
-    const secretGroup = await this.prisma.secretGroup.findUniqueOrThrow({
-      where: {id: secretGroupId},
+  private async getProjectSecretConfig(projectId: string) {
+    const project = await this.prisma.project.findUnique({
+      where: {id: projectId},
+      select: {
+        id: true,
+        name: true,
+        secretGroupId: true,
+        awsSecretsManagerRotationLambdaArn: true,
+      },
     });
 
-    if (!secretGroup.accessKeyId || !secretGroup.secretAccessKey || !secretGroup.rotationLambdaArn) {
-      throw new BadRequestException(`Project ${secretGroup.name} does not have AWS Secrets Manager configured`);
+    if (!project) {
+      throw new NotFoundException(`Project not found: ${projectId}`);
+    }
+    if (!project.secretGroupId) {
+      throw new BadRequestException(`Project ${project.name} does not have a Secret Group configured`);
     }
 
+    const credential = await this.credentialService.resolveProjectCredential(project.id);
+
     return {
-      accessKeyId: secretGroup.accessKeyId,
-      secretAccessKey: secretGroup.secretAccessKey,
-      rotationLambdaArn: secretGroup.rotationLambdaArn,
+      secretGroupId: project.secretGroupId,
+      accessKeyId: credential.accessKeyId,
+      secretAccessKey: credential.secretAccessKey,
+      defaultRegion: credential.defaultRegion,
+      rotationLambdaArn: project.awsSecretsManagerRotationLambdaArn,
     };
+  }
+
+  private async getProjectSecretConfigByGroupId(secretGroupId: string) {
+    const project = await this.prisma.project.findFirst({
+      where: {secretGroupId},
+      select: {id: true},
+    });
+    if (!project) {
+      throw new NotFoundException(`Project for Secret Group ${secretGroupId} not found`);
+    }
+    return await this.getProjectSecretConfig(project.id);
   }
 
   private getClient(config: {accessKeyId: string; secretAccessKey: string}, region?: string): SecretsManagerClient {
